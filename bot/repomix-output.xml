@@ -1,0 +1,579 @@
+This file is a merged representation of the entire codebase, combined into a single document by Repomix.
+
+<file_summary>
+This section contains a summary of this file.
+
+<purpose>
+This file contains a packed representation of the entire repository's contents.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+</purpose>
+
+<file_format>
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Repository files (if enabled)
+5. Multiple file entries, each consisting of:
+  - File path as an attribute
+  - Full contents of the file
+</file_format>
+
+<usage_guidelines>
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+</usage_guidelines>
+
+<notes>
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+- Files are sorted by Git change count (files with more changes are at the bottom)
+</notes>
+
+</file_summary>
+
+<directory_structure>
+core/
+  __init__.py
+  config.py
+  crud.py
+  database.py
+  models.py
+handlers/
+  __init__.py
+  all_handlers.py
+  common.py
+.dockerignore
+bot.py
+docker-compose.yml
+Dockerfile
+requirements.txt
+welcome.jpg
+</directory_structure>
+
+<files>
+This section contains the contents of the repository's files.
+
+<file path="core/config.py">
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+</file>
+
+<file path="core/crud.py">
+# core/crud.py
+from sqlalchemy import select
+from core.models import User, Submission
+
+# Импорт async_session внутри функций или внизу
+from core.database import async_session
+
+async def get_or_create_user(telegram_id: int, username: str | None = None) -> User:
+    async with async_session() as session:
+        result = await session.execute(select(User).where(User.telegram_id == telegram_id))
+        user = result.scalar_one_or_none()
+        if not user:
+            user = User(telegram_id=telegram_id, username=username)
+            session.add(user)
+            await session.commit()
+            await session.refresh(user)
+        return user
+
+async def create_submission(
+    user_id: int,
+    content_type: str,
+    raw_content: str,
+    ai_response: str,
+    ai_confidence: float,
+    suspicious: bool
+) -> Submission:
+    async with async_session() as session:
+        submission = Submission(
+            user_id=user_id,
+            content_type=content_type,
+            raw_content=raw_content,
+            ai_response=ai_response,
+            ai_confidence=ai_confidence,
+            suspicious=suspicious
+        )
+        session.add(submission)
+        await session.commit()
+        await session.refresh(submission)
+        return submission
+</file>
+
+<file path="core/database.py">
+# core/database.py
+import os
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+from sqlalchemy.orm import sessionmaker
+from dotenv import load_dotenv
+
+load_dotenv()
+
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise RuntimeError("❌ DATABASE_URL не задан в .env")
+
+engine = create_async_engine(DATABASE_URL, echo=False)
+async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+
+async def init_db():
+    from core.models import Base
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+</file>
+
+<file path="core/models.py">
+from sqlalchemy import Column, Integer, BigInteger, String, Boolean, Float, Text, DateTime, ForeignKey, CheckConstraint
+from sqlalchemy.orm import declarative_base
+from sqlalchemy.sql import func
+
+Base = declarative_base()
+
+
+class User(Base):
+    __tablename__ = "users"
+
+
+    id = Column(Integer, primary_key=True, index=True)
+    telegram_id = Column(BigInteger, unique=True, nullable=False)
+    username = Column(String, nullable=False)
+    first_seen = Column(DateTime(timezone=True), server_default=func.now())
+
+class Submission(Base):
+    __tablename__ = "submissions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    content_type = Column(String(10), nullable=False)
+    raw_content = Column(Text, nullable=True)
+    confirmed = Column(Boolean, default=True)  # всегда True при сохранении
+    suspicious = Column(Boolean, default=False)
+    ai_response = Column(Text, nullable=True)
+    ai_confidence = Column(Float, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        CheckConstraint(content_type.in_(["text", "image", "pdf"]), name="valid_content_type"),
+    )
+</file>
+
+<file path="handlers/all_handlers.py">
+from aiogram import Router, types, F
+from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile
+from handlers.common import read_image, read_PDF
+from core.crud import get_or_create_user, create_submission
+from PIL import Image
+import numpy as np
+
+router = Router()
+
+class OCRStates(StatesGroup):
+    waiting_for_content = State()
+    awaiting_confirmation = State()
+
+def get_main_menu_inline():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🤖 ИИ анализ рекламы", callback_data="menu_ai")],
+        [
+            InlineKeyboardButton(text="👤 Личный кабинет", callback_data="menu_profile"),
+            InlineKeyboardButton(text="📚 Полезные статьи", url="https://t.me/+bMfGP50ElTAxZTMy")
+        ],
+        [
+            InlineKeyboardButton(text="📤 Отправленные на рассмотрение", callback_data="menu_sent"),
+            InlineKeyboardButton(text="ℹ️ О нас", callback_data="menu_about")
+        ]
+    ])
+
+def get_back_to_menu_button():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="back_to_menu")]
+    ])
+
+def get_confirmation_buttons():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Всё верно", callback_data="confirm_yes"),
+            InlineKeyboardButton(text="❌ Нет", callback_data="confirm_no")
+        ],
+        [InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="back_to_menu")]
+    ])
+
+# --- /start ---
+@router.message(Command("start"))
+async def start_handler(message: types.Message):
+    await get_or_create_user(message.from_user.id, message.from_user.username)
+    try:
+        await message.answer_photo(
+            photo=FSInputFile("welcome.jpg"),
+            caption=(
+                "🛡️ Добро пожаловать в бота «Страж»!\n\n"
+                "Проверяйте рекламные материалы на соответствие законодательству РФ.\n"
+                "Выберите действие:"
+            ),
+            reply_markup=get_main_menu_inline()
+        )
+    except FileNotFoundError:
+        await message.answer(
+            "⚠️ Фото не найдено (`welcome.jpg`).\n"
+            "Но меню работает:",
+            reply_markup=get_main_menu_inline()
+        )
+
+# --- Меню ---
+@router.callback_query(F.data == "menu_ai")
+async def ai_helper(callback: types.CallbackQuery, state: FSMContext):
+    await state.set_state(OCRStates.waiting_for_content)
+    await callback.message.answer(
+        "📩 Отправьте текст, изображение (PNG/JPG) или PDF.",
+        reply_markup=get_back_to_menu_button()
+    )
+    await callback.answer()
+
+@router.callback_query(F.data == "menu_about")
+async def about_us(callback: types.CallbackQuery):
+    text = (
+        "🛡️ <b>Бот «Страж»</b>\n\n"
+        "Интеллектуальный помощник для проверки объявлений о сдаче жилья в аренду на соответствие закону РФ.\n\n"
+        "Мы помогаем бизнесу избежать:\n\n"
+        "• Блокировки объявления;\n"
+        "• Гражданско-правовой, административной и уголовной ответственности;\n"
+        "• Других рисков, связанных с нарушением требований законодательства.\n\n"
+        "💡 Бот анализирует текст, изображения и PDF-документы, "
+        "выявляя потенциально спорные формулировки.\n\n"
+        "<i>Разработано с заботой о юридической безопасности вашего бизнеса.</i>"
+    )
+    await callback.message.answer(text, parse_mode="HTML", reply_markup=get_back_to_menu_button())
+    await callback.answer()
+
+@router.callback_query(F.data.in_({"menu_profile", "menu_articles", "menu_sent"}))
+async def stub_handler(callback: types.CallbackQuery):
+    await callback.message.answer("🔜 Этот раздел пока в разработке.", reply_markup=get_back_to_menu_button())
+    await callback.answer()
+
+@router.callback_query(F.data == "back_to_menu")
+async def back_to_menu(callback: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    try:
+        await callback.message.answer_photo(
+            photo=FSInputFile("welcome.jpg"),
+            caption=(
+                "🛡️ Добро пожаловать в бота «Страж»!\n\n"
+                "Выберите действие:"
+            ),
+            reply_markup=get_main_menu_inline()
+        )
+    except FileNotFoundError:
+        await callback.message.answer(
+            "🛡️ Добро пожаловать в бота «Страж»!\n\n"
+            "Выберите действие:",
+            reply_markup=get_main_menu_inline()
+        )
+    await callback.answer()
+
+# --- Мок ИИ-анализа ---
+async def mock_ai_analysis(text: str):
+    confidence = 0.95 if len(text.strip()) > 20 else 0.3
+    is_suspicious = confidence < 0.5
+    response = (
+        "✅ Материал соответствует законодательству РФ."
+        if not is_suspicious else
+        "⚠️ Обнаружены потенциально спорные формулировки. Требуется проверка."
+    )
+    return response, confidence, is_suspicious
+
+def _normalize_text(text: str) -> str:
+    return (text or "(Текст не распознан)")[:3000]
+
+# --- Обработка контента ---
+@router.message(OCRStates.waiting_for_content, F.photo)
+async def handle_photo(message: types.Message, state: FSMContext):
+    try:
+        photo = message.photo[-1]
+        file = await message.bot.download(photo.file_id)
+        image = Image.open(file)
+        if image.mode in ("RGBA", "P"):
+            image = image.convert("RGB")
+        image_np = np.array(image)
+        text = read_image(image_np)
+        normalized = _normalize_text(text)
+        await state.update_data(content_type="image", raw_content=normalized)
+        await state.set_state(OCRStates.awaiting_confirmation)
+        await message.answer(
+            f"🔍 Распознанный текст:\n\n<code>{normalized}</code>",
+            parse_mode="HTML",
+            reply_markup=get_confirmation_buttons()
+        )
+    except Exception as e:
+        await message.answer(f"❌ Ошибка: {e}", reply_markup=get_back_to_menu_button())
+        await state.clear()
+
+@router.message(OCRStates.waiting_for_content, F.document.mime_type == "application/pdf")
+async def handle_pdf(message: types.Message, state: FSMContext):
+    try:
+        doc = message.document
+        if doc.file_size > 15 * 1024 * 1024:
+            await message.answer("⚠️ Файл слишком большой (макс. 15 МБ).", reply_markup=get_back_to_menu_button())
+            return
+        file = await message.bot.download(doc.file_id)
+        text = read_PDF(file)
+        normalized = _normalize_text(text)
+        await state.update_data(content_type="pdf", raw_content=normalized)
+        await state.set_state(OCRStates.awaiting_confirmation)
+        await message.answer(
+            f"🔍 Распознанный текст:\n\n<code>{normalized}</code>",
+            parse_mode="HTML",
+            reply_markup=get_confirmation_buttons()
+        )
+    except Exception as e:
+        await message.answer(f"❌ Ошибка: {e}", reply_markup=get_back_to_menu_button())
+        await state.clear()
+
+@router.message(OCRStates.waiting_for_content, F.text)
+async def handle_text(message: types.Message, state: FSMContext):
+    normalized = _normalize_text(message.text)
+    await state.update_data(content_type="text", raw_content=normalized)
+    await state.set_state(OCRStates.awaiting_confirmation)
+    await message.answer(
+        f"🔍 Ваш текст:\n\n<code>{normalized}</code>",
+        parse_mode="HTML",
+        reply_markup=get_confirmation_buttons()
+    )
+
+# --- Подтверждение ---
+@router.callback_query(F.data == "confirm_yes", OCRStates.awaiting_confirmation)
+async def confirm_yes(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    content_type = data.get("content_type")
+    raw_content = data.get("raw_content")
+
+    if not raw_content:
+        await callback.message.answer("❌ Нет данных для анализа.", reply_markup=get_back_to_menu_button())
+        await state.clear()
+        return
+
+    user = await get_or_create_user(callback.from_user.id, callback.from_user.username)
+    ai_response, confidence, is_suspicious = await mock_ai_analysis(raw_content)
+
+    await create_submission(
+        user_id=user.id,
+        content_type=content_type,
+        raw_content=raw_content,
+        ai_response=ai_response,
+        ai_confidence=confidence,
+        suspicious=is_suspicious
+    )
+
+    await callback.message.answer(
+        f"🔍 Результат анализа:\n\n{ai_response}\n\nУверенность: {confidence:.0%}",
+        reply_markup=get_back_to_menu_button()
+    )
+    await state.clear()
+    await callback.answer()
+
+@router.callback_query(F.data == "confirm_no", OCRStates.awaiting_confirmation)
+async def confirm_no(callback: types.CallbackQuery, state: FSMContext):
+    await state.set_state(OCRStates.waiting_for_content)
+    await callback.message.answer(
+        "😔 Мы пока не можем обработать такой сложный файл. Отправьте текстом, изображение или PDF.",
+        reply_markup=get_back_to_menu_button()
+    )
+    await callback.answer()
+</file>
+
+<file path="handlers/common.py">
+import io
+import pytesseract
+from PIL import Image
+from PyPDF2 import PdfReader
+
+# Укажите путь к tesseract, если он не в PATH (обычно не нужно на Arch)
+# pytesseract.pytesseract.tesseract_cmd = '/usr/bin/tesseract'
+
+def read_image(image_np):
+    """
+    Распознаёт текст на изображении (numpy array) с помощью Tesseract.
+    Поддержка русского и английского языков.
+    """
+    try:
+        # Конвертируем numpy array → PIL Image
+        image = Image.fromarray(image_np)
+        # Распознаём текст
+        text = pytesseract.image_to_string(image, lang='rus+eng')
+        return text.strip()
+    except Exception as e:
+        print(f"Ошибка Tesseract: {e}")
+        return "Error occurred when parsing image"
+
+
+def read_PDF(pdf_data):
+    """
+    Извлекает текст из PDF-файла (объект BytesIO).
+    """
+    try:
+        text = ''
+        pdf_file = PdfReader(pdf_data)
+        for page in pdf_file.pages:
+            extracted = page.extract_text()
+            if extracted:
+                text += extracted
+        return text.strip()
+    except Exception as e:
+        print(f"Ошибка PDF: {e}")
+        return "Error occurred when parsing PDF"
+</file>
+
+<file path=".dockerignore">
+__pycache__/
+*.pyc
+.git/
+.env
+.gitignore
+README.md
+Dockerfile
+.dockerignore
+</file>
+
+<file path="bot.py">
+import asyncio
+from aiogram import Bot, Dispatcher
+from aiogram.enums import ParseMode
+from aiogram.client.default import DefaultBotProperties
+from aiogram.fsm.storage.memory import MemoryStorage  # <-- добавлено
+import core.config as config  # исправлен импорт
+
+from handlers.all_handlers import router
+from core.database import init_db
+
+async def main():
+    await init_db()
+    bot = Bot(
+        token=config.BOT_TOKEN,
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+    )
+    
+    dp = Dispatcher(storage=MemoryStorage())  # <-- добавлено storage
+
+    dp.include_router(router)
+
+    try:
+        print("Бот запущен. Ctrl+C для остановки")
+        await dp.start_polling(bot)
+    except KeyboardInterrupt:
+        print("\nОстанавливаю")
+    finally:
+        await bot.session.close()
+        print("Бот остановлен")
+
+if __name__ == "__main__":
+    asyncio.run(main())
+</file>
+
+<file path="docker-compose.yml">
+# docker-compose.yml
+version: '3.8'
+
+services:
+  db:
+    image: postgres:16
+    restart: always
+    environment:
+      POSTGRES_DB: storazh_db
+      POSTGRES_USER: storazh_user
+      POSTGRES_PASSWORD: storazh_pass
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U storazh_user -d storazh_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  bot:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    env_file:
+      - .env
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+</file>
+
+<file path="Dockerfile">
+FROM python:3.12-slim
+
+RUN apt-get update && apt-get install -y \
+    tesseract-ocr \
+    poppler-utils \
+    wget \
+    && rm -rf /var/lib/apt/lists/*
+
+
+RUN mkdir -p /usr/share/tesseract-ocr/5/tessdata \
+    && wget -O /usr/share/tesseract-ocr/5/tessdata/eng.traineddata \
+       https://github.com/tesseract-ocr/tessdata/raw/main/eng.traineddata \
+    && wget -O /usr/share/tesseract-ocr/5/tessdata/rus.traineddata \
+       https://github.com/tesseract-ocr/tessdata/raw/main/rus.traineddata
+
+
+WORKDIR /app
+
+COPY requirements.txt .
+
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+CMD ["python", "bot.py"]
+</file>
+
+<file path="requirements.txt">
+aiofiles==24.1.0
+aiogram==3.22.0
+aiohappyeyeballs==2.6.1
+aiohttp==3.12.15
+aiosignal==1.4.0
+annotated-types==0.7.0
+attrs==25.4.0
+certifi==2025.10.5
+frozenlist==1.8.0
+idna==3.11
+magic-filter==1.0.12
+multidict==6.7.0
+numpy==2.3.4
+packaging==25.0
+pillow==12.0.0
+propcache==0.4.1
+pydantic==2.11.10
+pydantic_core==2.33.2
+PyPDF2==3.0.1
+pytesseract==0.3.13
+python-dotenv==1.1.1
+typing-inspection==0.4.2
+typing_extensions==4.15.0
+yarl==1.22.0
+asyncpg
+sqlalchemy[asyncio]
+alembic
+</file>
+
+</files>

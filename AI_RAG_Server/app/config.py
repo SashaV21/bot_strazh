@@ -1,0 +1,5 @@
+VECTOR_STORz_PATH = "data/faiss_index"
+DOCUMENTS_PATH = "data/documents"
+EMBEDDING_MODEL = "cointegrated/rubert-tiny2"
+LLM_MODEL = "llama3"
+CHROMA_DB_PATH = "chroma_db"
